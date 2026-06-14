@@ -3,10 +3,14 @@
 import os
 
 # --- credentials: injected at build time via scripts/update_credentials.py — do not edit ---
-APP_KEY: str = ""
-APP_SECRET: str = ""
-MAMMOTION_OAUTH2_CLIENT_ID: str = ""
-MAMMOTION_OAUTH2_CLIENT_SECRET: str = ""
+def _r(d: tuple[int, ...]) -> str:
+    _k = (109, 97, 109, 109, 111, 116, 105, 111, 110, 95, 97, 112, 112)
+    return bytes(v ^ _k[i % len(_k)] for i, v in enumerate(d)).decode()
+
+APP_KEY = _r((94, 85, 95, 92, 86, 68, 91, 88))
+APP_SECRET = _r((8, 2, 14, 88, 92, 71, 15, 87, 94, 104, 4, 69, 67, 91, 88, 15, 92, 13, 77, 13, 11, 91, 110, 87, 73, 20, 91, 7, 14, 88, 92, 64))
+MAMMOTION_OAUTH2_CLIENT_ID = _r((42, 25, 8, 15, 8, 39, 29, 87, 29, 54, 87, 0, 59, 28, 51))
+MAMMOTION_OAUTH2_CLIENT_SECRET = _r((39, 49, 93, 88, 95, 76, 58, 61, 36, 25, 0, 64, 49, 84, 81, 44, 41, 31, 14, 37, 38, 32, 27, 35, 8, 61, 12, 85, 59, 7))
 # --- end credentials ---
 
 if not APP_KEY:
