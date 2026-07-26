@@ -66,7 +66,7 @@ class BLETransportConfig:
     scan_timeout: float = 10.0
     connect_failure_threshold: int = 1
     connect_cooldown_seconds: float = 120.0
-    min_rssi: int = -90
+    min_rssi: int = -80
 
 
 class BLETransport(Transport):
