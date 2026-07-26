@@ -1275,7 +1275,7 @@ class DeviceHandle:
         """
         if self._ble_stream_active:
             return
-        await self._send_one_shot_report()
+        await self._send_one_shot_report(source="snapshot")
 
     async def start_report_stream(self, duration_ms: int = 300_000) -> None:
         """Start a transient report window lasting ``duration_ms`` ms.
@@ -1332,6 +1332,8 @@ class DeviceHandle:
         self,
         cmd_bytes: bytes,
         transport_send: Callable[[bytes], Awaitable[None]],
+        *,
+        source: str = "?",
     ) -> bool:
         """Send an ``RPT_START`` and wait for the first ``toapp_report_data`` ack.
 
@@ -1357,7 +1359,11 @@ class DeviceHandle:
             attempts[0] += 1
             if attempts[0] > 1:
                 try:
-                    _logger.debug("RPT_START [%s]: retry-prefix sending todev_ble_sync(3)", self.device_name)
+                    _logger.debug(
+                        "RPT_START [%s] (source=%s): retry-prefix sending todev_ble_sync(3)",
+                        self.device_name,
+                        source,
+                    )
                     await transport_send(sync_bytes)
                 except Exception:  # noqa: BLE001
                     _logger.debug(
@@ -1369,6 +1375,7 @@ class DeviceHandle:
 
         try:
             await self.broker.send_and_wait(_send, expected_field="toapp_report_data")
+            _logger.debug("RPT_START [%s] (source=%s): ack OK — counters reset", self.device_name, source)
             self._rpt_fail_streak = 0
             self._rpt_fail_since_data = 0
             self._last_report_ok_ts = time.time()
@@ -1382,9 +1389,11 @@ class DeviceHandle:
             self._rpt_fail_streak += 1
             self._rpt_fail_since_data += 1
             _logger.debug(
-                "RPT_START [%s]: no toapp_report_data ack (streak=%d) — next poll tick will retry",
+                "RPT_START [%s] (source=%s): no toapp_report_data ack (streak=%d, since_data=%d) — retry next tick",
                 self.device_name,
+                source,
                 self._rpt_fail_streak,
+                self._rpt_fail_since_data,
             )
             if self._rpt_fail_since_data >= _RPT_FAIL_BLE_RESET_THRESHOLD:
                 # Genuine TOTAL freeze: verified RPT_STARTs keep timing out AND no
@@ -1415,7 +1424,7 @@ class DeviceHandle:
                 )
             return False
 
-    async def _send_report_stream_start(self, duration_ms: int) -> None:
+    async def _send_report_stream_start(self, duration_ms: int, *, source: str = "stream_start") -> None:
         """Enqueue RPT_START count=0 via best transport."""
         cmd_bytes = self.commands.request_iot_sys(
             rpt_act=RptAct.RPT_START,
@@ -1427,7 +1436,7 @@ class DeviceHandle:
         )
 
         async def _send() -> None:
-            await self._send_rpt_start_verified(cmd_bytes, self.send_raw)
+            await self._send_rpt_start_verified(cmd_bytes, self.send_raw, source=source)
 
         await self.queue.enqueue(_send, priority=Priority.BACKGROUND, skip_if_saga_active=True)
 
@@ -1458,11 +1467,14 @@ class DeviceHandle:
 
         await self.queue.enqueue(_send, priority=Priority.BACKGROUND, skip_if_saga_active=True)
 
-    async def _send_one_shot_report(self) -> None:
+    async def _send_one_shot_report(self, *, source: str = "poll") -> None:
         """Enqueue a one-shot ``request_iot_sys(count=1)`` data refresh.
 
         Routes via the best available transport — BLE if connected and preferred,
         MQTT otherwise — matching the same transport-priority rules as user commands.
+
+        ``source`` is a diagnostic label threaded into the RPT_START log so the
+        enqueuer is visible (e.g. ``mqtt_poll`` / ``ble_poll`` / ``snapshot``).
         """
         cmd_bytes = self.commands.request_iot_sys(
             rpt_act=RptAct.RPT_START,
@@ -1472,7 +1484,7 @@ class DeviceHandle:
         )
 
         async def _send() -> None:
-            await self._send_rpt_start_verified(cmd_bytes, self.send_raw)
+            await self._send_rpt_start_verified(cmd_bytes, self.send_raw, source=source)
 
         await self.queue.enqueue(
             _send,
@@ -1481,7 +1493,7 @@ class DeviceHandle:
             dedup_key="one_shot_report",
         )
 
-    async def request_reports(self, count: int = 1, timeout: int = 10_000) -> None:
+    async def request_reports(self, count: int = 1, timeout: int = 10_000, *, source: str = "request_reports") -> None:
         """Enqueue a one-shot "request_iot_sys(count=count)" data refresh."""
         cmd_bytes = self.commands.request_iot_sys(
             rpt_act=RptAct.RPT_START,
@@ -1491,11 +1503,11 @@ class DeviceHandle:
         )
 
         async def _send() -> None:
-            await self._send_rpt_start_verified(cmd_bytes, self.send_raw)
+            await self._send_rpt_start_verified(cmd_bytes, self.send_raw, source=source)
 
         await self.queue.enqueue(_send, priority=Priority.BACKGROUND, skip_if_saga_active=True)
 
-    async def _enqueue_ble_stream_command(self, act: RptAct, count: int) -> None:
+    async def _enqueue_ble_stream_command(self, act: RptAct, count: int, *, source: str = "ble_stream") -> None:
         """Enqueue a BLE-pinned ``request_iot_sys`` config command.
 
         ``count=0`` (with ``RPT_START``) starts/renews the continuous stream;
@@ -1531,7 +1543,7 @@ class DeviceHandle:
                 await ble.send_heartbeat(payload, iot_id=self.iot_id)
 
             if act is RptAct.RPT_START:
-                if await self._send_rpt_start_verified(cmd_bytes, _ble_send):
+                if await self._send_rpt_start_verified(cmd_bytes, _ble_send, source=source):
                     self._ble_stream_active = True
                 return
             try:

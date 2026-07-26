@@ -169,4 +169,4 @@ async def mqtt_activity_loop(handle: DeviceHandle) -> None:
             interval,
         )
         last_poll_sent_at = time.monotonic()
-        await handle._send_one_shot_report()  # noqa: SLF001
+        await handle._send_one_shot_report(source="mqtt_poll")  # noqa: SLF001

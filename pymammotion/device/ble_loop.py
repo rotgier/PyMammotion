@@ -233,7 +233,7 @@ async def ble_polling_loop(handle: DeviceHandle) -> None:
                 now = time.monotonic()
                 if now - last_one_shot_at >= ble_interval and not handle.in_no_request_mode():
                     try:
-                        await handle._send_one_shot_report()  # noqa: SLF001
+                        await handle._send_one_shot_report(source="ble_poll")  # noqa: SLF001
                         last_one_shot_at = now
                     except Exception:
                         _logger.debug(
