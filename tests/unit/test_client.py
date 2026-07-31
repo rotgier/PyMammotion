@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from unittest.mock import ANY, AsyncMock, MagicMock, PropertyMock, patch
 
 import pytest
@@ -801,9 +802,16 @@ async def test_send_command_with_args_prefer_ble_uses_mqtt_while_ble_connect_pen
 from pymammotion.device.ble_loop import _BLE_POLL_INTERVAL, _KEEP_ALIVE_BLE_INTERVAL  # noqa: E402
 from pymammotion.device.modes import _DeviceMode  # noqa: E402
 from pymammotion.device.mqtt_loop import (  # noqa: E402
+    _ACTIVE_LOW_BATTERY_INTERVAL,
+    _ACTIVE_NEAR_END_INTERVAL,
+    _ACTIVE_PRE_NONWORK_INTERVAL,
+    _ACTIVE_RESUME_DENSE_INTERVAL,
+    _ACTIVE_RESUME_DENSE_WINDOW,
+    _DOCKED_BLE_RECONNECT_INTERVAL,
     _MQTT_POLL_INTERVAL,
     _RATE_LIMITED_BACKOFF,
     mqtt_activity_loop,
+    poll_interval,
 )
 
 
@@ -818,21 +826,112 @@ def _make_handle_for_poll(transport_type: TransportType | None) -> DeviceHandle:
     return handle
 
 
-async def test_poll_interval_mowing_returns_fifteen_minutes() -> None:
+def _defeat_active_overlays(handle: DeviceHandle) -> None:
+    """Neutralise the ACTIVE dense-cadence overlays so the base interval shows.
+
+    Sets battery above the low-battery threshold and expires the resume window,
+    leaving ``poll_interval`` to return the plain ACTIVE base (progress defaults
+    to 0, below the near-end threshold).
+    """
+    handle.snapshot.raw.report_data.dev.battery_val = 50
+    handle._mowing_active_since = time.monotonic() - _ACTIVE_RESUME_DENSE_WINDOW - 1  # noqa: SLF001
+
+
+async def test_poll_interval_mowing_base_is_ten_minutes() -> None:
     from pymammotion.utility.constant import WorkMode
 
     handle = _make_handle_for_poll(TransportType.CLOUD_ALIYUN)
     handle.snapshot.raw.report_data.dev.sys_status = WorkMode.MODE_WORKING.value
+    _defeat_active_overlays(handle)
+    interval, reason = poll_interval(handle)
+    assert interval == _MQTT_POLL_INTERVAL[_DeviceMode.ACTIVE]
+    assert reason == "base:active"
+    assert handle.device_mode() is _DeviceMode.ACTIVE
     assert handle._poll_interval() == _MQTT_POLL_INTERVAL[_DeviceMode.ACTIVE]  # noqa: SLF001
-    assert handle.device_mode() is _DeviceMode.ACTIVE  # noqa: SLF001
 
 
-async def test_poll_interval_returning_returns_fifteen_minutes() -> None:
+async def test_resume_window_arms_on_fresh_working() -> None:
+    """A fresh WORKING start (mowing_active_since unset, on cloud) arms the resume window."""
     from pymammotion.utility.constant import WorkMode
 
     handle = _make_handle_for_poll(TransportType.CLOUD_ALIYUN)
-    handle.snapshot.raw.report_data.dev.sys_status = WorkMode.MODE_RETURNING.value
-    assert handle._poll_interval() == _MQTT_POLL_INTERVAL[_DeviceMode.ACTIVE]  # noqa: SLF001
+    handle.snapshot.raw.report_data.dev.sys_status = WorkMode.MODE_WORKING.value
+    handle.snapshot.raw.report_data.dev.battery_val = 50  # no low-battery
+    handle._mowing_active_since = 0.0  # noqa: SLF001 — not yet armed
+    interval, reason = poll_interval(handle)
+    assert interval == _ACTIVE_RESUME_DENSE_INTERVAL
+    assert reason == "resume-window"
+
+
+async def test_resume_window_reset_when_paused_not_working() -> None:
+    """PAUSE is in device_mode ACTIVE but is NOT actively mowing — it must clear
+    _mowing_active_since so a stale value can't keep the resume window (or leave it
+    armed) across a long pause (2026-07-27 since_active=51253s bug)."""
+    from pymammotion.utility.constant import WorkMode
+
+    handle = _make_handle_for_poll(TransportType.CLOUD_ALIYUN)
+    handle.snapshot.raw.report_data.dev.sys_status = WorkMode.MODE_PAUSE.value
+    handle.snapshot.raw.report_data.dev.battery_val = 50
+    handle._mowing_active_since = time.monotonic()  # noqa: SLF001 — as if recently armed
+    interval, reason = poll_interval(handle)
+    assert handle.device_mode() is _DeviceMode.ACTIVE  # PAUSE still buckets to ACTIVE
+    assert handle._mowing_active_since == 0.0  # noqa: SLF001 — reset because not WORKING
+    assert reason == "base:active"  # no resume-window overlay while paused
+    assert interval == _MQTT_POLL_INTERVAL[_DeviceMode.ACTIVE]
+
+
+async def test_poll_interval_low_battery_overlay_reason() -> None:
+    """battery < threshold in ACTIVE → low-battery overlay + labelled reason."""
+    from pymammotion.utility.constant import WorkMode
+
+    handle = _make_handle_for_poll(TransportType.CLOUD_ALIYUN)
+    handle.snapshot.raw.report_data.dev.sys_status = WorkMode.MODE_WORKING.value
+    handle.snapshot.raw.report_data.dev.battery_val = 10  # < _ACTIVE_LOW_BATTERY_THRESHOLD (22)
+    handle._mowing_active_since = time.monotonic() - _ACTIVE_RESUME_DENSE_WINDOW - 1  # noqa: SLF001 — expire resume window
+    interval, reason = poll_interval(handle)
+    assert interval == _ACTIVE_LOW_BATTERY_INTERVAL
+    assert reason == "low-battery"
+
+
+async def test_poll_interval_near_end_reads_progress_from_work_area() -> None:
+    """near-end reads progress % from work.area>>16 (NOT work.progress, which is
+    packed total/left time). Regression guard for the 2026-07-26 wrong-field bug
+    where total_time minutes (375) were mistaken for a percentage."""
+    from pymammotion.utility.constant import WorkMode
+
+    handle = _make_handle_for_poll(TransportType.CLOUD_ALIYUN)
+    handle.snapshot.raw.report_data.dev.sys_status = WorkMode.MODE_WORKING.value
+    _defeat_active_overlays(handle)  # battery/resume neutralised
+    # A packed time value in work.progress must NOT be read as a percentage; only
+    # work.area>>16 counts. Set total_time=375 (>96 if misread) yet progress% via area.
+    handle.snapshot.raw.report_data.work.progress = 375
+    handle.snapshot.raw.report_data.work.area = (99 << 16)  # progress% = 99, area = 0
+    interval, reason = poll_interval(handle)
+    assert interval == _ACTIVE_NEAR_END_INTERVAL
+    assert reason == "near-end"
+    assert handle.work_progress == 99
+
+
+async def test_poll_interval_pre_nonwork_overlay_reason() -> None:
+    """Within the pre-non-work window (ACTIVE) → pre-nonwork overlay + reason.
+
+    Non-work start is set ~10 min from now as MINUTES-FROM-MIDNIGHT (the device's
+    real encoding, e.g. "1230" == 20:30 — NOT HHMM); midnight wrap is handled by the
+    modulo in _minutes_until_nonwork_start, so this is robust at any wall-clock time.
+    """
+    from datetime import datetime, timedelta
+
+    from pymammotion.utility.constant import WorkMode
+
+    handle = _make_handle_for_poll(TransportType.CLOUD_ALIYUN)
+    handle.snapshot.raw.report_data.dev.sys_status = WorkMode.MODE_WORKING.value
+    _defeat_active_overlays(handle)  # neutralise resume-window + low-battery (progress stays 0)
+    target = datetime.now() + timedelta(minutes=10)
+    target_minutes = (target.hour * 60 + target.minute) % 1440
+    handle.snapshot.raw.non_work_hours.start_time = str(target_minutes)
+    interval, reason = poll_interval(handle)
+    assert interval == _ACTIVE_PRE_NONWORK_INTERVAL
+    assert reason == "pre-nonwork"
 
 
 async def test_poll_interval_idle_returns_fifteen_minutes() -> None:
@@ -861,6 +960,101 @@ async def test_poll_interval_docked_full_returns_sixty_minutes() -> None:
     assert handle._poll_interval() == _MQTT_POLL_INTERVAL[_DeviceMode.DOCKED_FULL]  # noqa: SLF001
 
 
+async def test_poll_interval_docked_ble_reconnect_when_usable() -> None:
+    """Docked + BLE disconnected-but-usable → dense 20s poll to nudge a BLE reconnect."""
+    handle = _make_handle_for_poll(TransportType.CLOUD_ALIYUN)
+    handle.snapshot.raw.report_data.dev.sys_status = 0
+    handle.snapshot.raw.report_data.dev.battery_val = 80
+    handle.snapshot.raw.report_data.dev.charge_state = 1  # DOCKED_CHARGING
+    ble = _make_connected_transport(TransportType.BLE)
+    ble.is_connected = False  # disconnected...
+    ble.is_usable = True  # ...but usable (advert cached, not in cooldown)
+    handle._transports[TransportType.BLE] = ble  # noqa: SLF001
+    interval, reason = poll_interval(handle)
+    assert interval == _DOCKED_BLE_RECONNECT_INTERVAL
+    assert reason == "docked-ble-reconnect"
+
+
+async def test_poll_interval_docked_no_dense_poll_when_ble_unusable() -> None:
+    """Docked + BLE disconnected but NOT usable (cooldown/no advert) → normal DOCKED
+    cadence, NOT dense — guards the cloud budget against hammering an unreachable BLE."""
+    handle = _make_handle_for_poll(TransportType.CLOUD_ALIYUN)
+    handle.snapshot.raw.report_data.dev.sys_status = 0
+    handle.snapshot.raw.report_data.dev.battery_val = 80
+    handle.snapshot.raw.report_data.dev.charge_state = 1  # DOCKED_CHARGING
+    ble = _make_connected_transport(TransportType.BLE)
+    ble.is_connected = False
+    ble.is_usable = False  # not reconnectable right now
+    handle._transports[TransportType.BLE] = ble  # noqa: SLF001
+    interval, reason = poll_interval(handle)
+    assert interval == _MQTT_POLL_INTERVAL[_DeviceMode.DOCKED_CHARGING]
+    assert reason == "base:docked_charging"
+
+
+async def test_poll_interval_docked_no_dense_poll_after_settling_window() -> None:
+    """Docked > _RECENT_DOCK_WINDOW ago + BLE disconnected+usable → normal DOCKED cadence,
+    NOT dense: the reconnect nudge is bounded to the dock-settling window so a persistent
+    usable-but-not-connecting BLE can't drive 20s cloud polling forever."""
+    from pymammotion.device.handle import _RECENT_DOCK_WINDOW
+
+    handle = _make_handle_for_poll(TransportType.CLOUD_ALIYUN)
+    handle.snapshot.raw.report_data.dev.sys_status = 0
+    handle.snapshot.raw.report_data.dev.battery_val = 80
+    handle.snapshot.raw.report_data.dev.charge_state = 1  # DOCKED_CHARGING
+    handle._docked_since = time.monotonic() - _RECENT_DOCK_WINDOW - 1  # noqa: SLF001 — settled long ago
+    ble = _make_connected_transport(TransportType.BLE)
+    ble.is_connected = False
+    ble.is_usable = True  # usable, but the window has passed
+    handle._transports[TransportType.BLE] = ble  # noqa: SLF001
+    interval, reason = poll_interval(handle)
+    assert interval == _MQTT_POLL_INTERVAL[_DeviceMode.DOCKED_CHARGING]
+    assert reason == "base:docked_charging"
+
+
+async def test_fast_ble_cooldown_while_returning_or_recently_docked() -> None:
+    """BLE cooldown override is the short value while RETURNING or just after docking;
+    None otherwise. Feeds BLETransport.set_cooldown_seconds_provider so a failed connect
+    in the coming-home / dock-settling phase cools down ~20s instead of 120s."""
+    from pymammotion.device.handle import _FAST_BLE_COOLDOWN_SECONDS, _RECENT_DOCK_WINDOW
+    from pymammotion.utility.constant import WorkMode
+
+    handle = _make_handle_for_poll(TransportType.CLOUD_ALIYUN)
+
+    # RETURNING → fast cooldown.
+    handle.snapshot.raw.report_data.dev.sys_status = WorkMode.MODE_RETURNING.value
+    assert handle._is_returning() is True  # noqa: SLF001
+    assert handle._ble_cooldown_seconds_override() == _FAST_BLE_COOLDOWN_SECONDS  # noqa: SLF001
+
+    # WORKING (ACTIVE but not returning) with no recent dock → no override.
+    handle.snapshot.raw.report_data.dev.sys_status = WorkMode.MODE_WORKING.value
+    handle._docked_since = 0.0  # noqa: SLF001
+    assert handle._is_returning() is False  # noqa: SLF001
+    assert handle._ble_cooldown_seconds_override() is None  # noqa: SLF001
+
+    # Docked within the settling window → fast cooldown even when not RETURNING.
+    handle._docked_since = time.monotonic()  # noqa: SLF001 — just docked
+    assert handle._recently_docked() is True  # noqa: SLF001
+    assert handle._ble_cooldown_seconds_override() == _FAST_BLE_COOLDOWN_SECONDS  # noqa: SLF001
+
+    # Docked longer than the window → back to default (None).
+    handle._docked_since = time.monotonic() - _RECENT_DOCK_WINDOW - 1  # noqa: SLF001
+    assert handle._recently_docked() is False  # noqa: SLF001
+    assert handle._ble_cooldown_seconds_override() is None  # noqa: SLF001
+
+
+async def test_poll_interval_returning_overlay() -> None:
+    """RETURNING (ACTIVE) → poll cadence tightened to _ACTIVE_RETURNING_INTERVAL."""
+    from pymammotion.device.mqtt_loop import _ACTIVE_RETURNING_INTERVAL
+    from pymammotion.utility.constant import WorkMode
+
+    handle = _make_handle_for_poll(TransportType.CLOUD_ALIYUN)
+    handle.snapshot.raw.report_data.dev.sys_status = WorkMode.MODE_RETURNING.value
+    _defeat_active_overlays(handle)  # expire resume-window + battery ok (so base would be 600)
+    interval, reason = poll_interval(handle)
+    assert interval == _ACTIVE_RETURNING_INTERVAL
+    assert reason == "returning"
+
+
 async def test_ble_poll_interval_table_values() -> None:
     """ACTIVE → continuous stream (None); other modes → numeric count=1 cadences."""
     assert _BLE_POLL_INTERVAL[_DeviceMode.ACTIVE] is None
@@ -882,7 +1076,7 @@ async def test_poll_loop_sends_after_silence() -> None:
 
     one_shot_mock = AsyncMock()
 
-    async def _send_and_stop() -> None:
+    async def _send_and_stop(*_args: object, **_kwargs: object) -> None:
         handle._stopping = True  # noqa: SLF001
         await one_shot_mock()
 
@@ -974,7 +1168,7 @@ async def test_poll_loop_rate_limited_with_ble_still_polls() -> None:
 
     one_shot_mock = AsyncMock()
 
-    async def _send_and_stop() -> None:
+    async def _send_and_stop(*_args: object, **_kwargs: object) -> None:
         handle._stopping = True  # noqa: SLF001
         await one_shot_mock()
 
@@ -1463,7 +1657,7 @@ async def test_poll_loop_resumes_after_mqtt_offline_clears() -> None:
 
     one_shot_mock = AsyncMock()
 
-    async def _send_and_stop() -> None:
+    async def _send_and_stop(*_args: object, **_kwargs: object) -> None:
         handle._stopping = True  # noqa: SLF001
         await one_shot_mock()
 

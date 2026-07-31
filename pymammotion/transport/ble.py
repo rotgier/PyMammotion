@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 import contextlib
 from dataclasses import dataclass
 import logging
@@ -110,6 +111,12 @@ class BLETransport(Transport):
         #: ``time.monotonic()`` deadline before another connect attempt is allowed.
         #: 0.0 when no cooldown is active.
         self._connect_cooldown_until: float = 0.0
+        #: Optional override for the cooldown DURATION, injected by the owning handle
+        #: (``set_cooldown_seconds_provider``) so it can shorten the cooldown in device
+        #: states where a fast BLE retry matters (e.g. RETURNING — Luba nearing the
+        #: dock).  Consulted each time a cooldown is armed; None → use the static
+        #: ``config.connect_cooldown_seconds`` default.
+        self._cooldown_seconds_provider: Callable[[], float | None] | None = None
         #: Last advertisement RSSI (dBm) pushed via ``set_ble_device``.  ``None``
         #: until a caller supplies one — an unknown RSSI never gates ``is_usable``.
         self._last_rssi: int | None = None
@@ -164,6 +171,17 @@ class BLETransport(Transport):
         self._consecutive_failures = 0
         self._connect_cooldown_until = 0.0
         self._last_rssi = None
+
+    def set_cooldown_seconds_provider(self, provider: Callable[[], float | None] | None) -> None:
+        """Inject an override for the connect-cooldown DURATION.
+
+        The owning handle uses this to shorten the cooldown in device states where a
+        fast BLE retry matters (e.g. RETURNING — Luba nearing the dock, so we want to
+        re-grab BLE within seconds rather than sit ~2 min on cloud).  The provider is
+        consulted each time a cooldown is armed; returning None uses the static
+        ``config.connect_cooldown_seconds`` default.
+        """
+        self._cooldown_seconds_provider = provider
 
     @property
     def ble_address(self) -> str | None:
@@ -371,14 +389,16 @@ class BLETransport(Transport):
         self._consecutive_failures += 1
         if not immediate and self._consecutive_failures < self._config.connect_failure_threshold:
             return
-        self._connect_cooldown_until = time.monotonic() + self._config.connect_cooldown_seconds
+        override = self._cooldown_seconds_provider() if self._cooldown_seconds_provider is not None else None
+        cooldown_seconds = override if override is not None else self._config.connect_cooldown_seconds
+        self._connect_cooldown_until = time.monotonic() + cooldown_seconds
         _logger.info(
             "BLETransport[%s]: %s — cooling down for %.0fs (is_usable now False; sends use MQTT)",
             self._config.device_id,
             "out of connection slots / device unreachable"
             if immediate
             else f"{self._consecutive_failures} consecutive connect failures",
-            self._config.connect_cooldown_seconds,
+            cooldown_seconds,
         )
         # Reset counter so the next post-cooldown attempt starts a fresh tally.
         self._consecutive_failures = 0

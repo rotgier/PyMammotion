@@ -46,7 +46,7 @@ from pymammotion.transport.base import (
     TransportType,
 )
 from pymammotion.transport.ble import BLETransport
-from pymammotion.utility.constant import MOWING_ACTIVE_MODES, NO_REQUEST_MODES
+from pymammotion.utility.constant import MOWING_ACTIVE_MODES, NO_REQUEST_MODES, WorkMode
 from pymammotion.utility.device_type import DeviceType
 
 _T = TypeVar("_T")
@@ -89,6 +89,17 @@ _BLE_FORCE_DISCONNECT_DEBOUNCE: float = 120.0
 #: fallback: on timeout the burst goes over cloud, so a BLE-out-of-range boot
 #: never hangs.
 _BOOT_BLE_WAIT_TIMEOUT: float = 30.0
+
+#: Shortened BLE connect-cooldown for the "coming home + settling on the dock" phase:
+#: while RETURNING, or within ``_RECENT_DOCK_WINDOW`` after docking.  A failed connect
+#: normally arms a 120 s cooldown (BLETransport default), but here Luba is at/near the
+#: ESP proxy and we want to re-grab BLE within seconds (drop off cloud fast), so early
+#: failures shouldn't lock BLE out for 2 min.  Injected into the BLE transport via
+#: ``set_cooldown_seconds_provider``; only cheap BLE ops (via the proxy) retry — no
+#: cloud sends — and the phase is transient.
+_FAST_BLE_COOLDOWN_SECONDS: float = 20.0
+#: How long after docking the fast BLE cooldown still applies (dock-settling window).
+_RECENT_DOCK_WINDOW: float = 5 * 60.0
 
 #: Channels sent in one-shot (count=1) polls AND in the BLE continuous stream.
 _REPORT_CHANNELS: list[RptInfoType] = [
@@ -307,6 +318,22 @@ class DeviceHandle:
         #: Monotonic timestamp of the last successfully-parsed inbound LubaMsg.
         #: Used by ensure_fresh_state to decide whether a snapshot poll is needed.
         self._last_report_at: float = 0.0
+        #: Monotonic timestamp of when the MQTT poll loop first saw ACTIVE (mowing)
+        #: mode, 0.0 when not mowing.  Drives the post-resume dense-cadence window in
+        #: ``mqtt_loop.poll_interval``.
+        self._mowing_active_since: float = 0.0
+        #: Monotonic timestamp of when the poll loop first saw a DOCKED mode
+        #: (DOCKED_CHARGING/DOCKED_FULL), 0.0 when not docked.  Drives the dock-settling
+        #: fast-BLE-cooldown window (``_recently_docked``); maintained in
+        #: ``mqtt_loop.poll_interval`` alongside ``_mowing_active_since``.
+        self._docked_since: float = 0.0
+        #: Diagnostic: the seconds the MQTT activity loop is currently sleeping and
+        #: the reason it chose that sleep (overlay name or defer state).  Written by
+        #: ``mqtt_loop._record_and_sleep`` each tick; surfaced by the poll-cadence
+        #: sensor so cadence is observable instead of reverse-engineered from a bare
+        #: "interval=Xs" log line (see 2026-07-26 "why 180s?" investigation).
+        self._last_poll_sleep_seconds: float = 0.0
+        self._last_poll_reason: str = "init"
         #: Silent-freeze detection (cloud-path): tracks the verified RPT_START
         #: outcome specifically (toapp_report_data ack), NOT any LubaMsg like
         #: _last_report_at — so it is immune to the junk-message masking that
@@ -369,6 +396,9 @@ class DeviceHandle:
         """Wire callbacks on a transport and register it."""
         transport.on_message = self._make_message_handler(transport.transport_type)
         transport.add_availability_listener(self._make_availability_handler(transport.transport_type))
+        if transport.transport_type == TransportType.BLE:
+            # Let the BLE transport ask us for a state-dependent cooldown (short while RETURNING).
+            cast(BLETransport, transport).set_cooldown_seconds_provider(self._ble_cooldown_seconds_override)
         self._transports[transport.transport_type] = transport
 
     def _make_message_handler(self, transport_type: TransportType) -> Callable[[bytes], Awaitable[None]]:
@@ -1282,6 +1312,79 @@ class DeviceHandle:
         except (AttributeError, TypeError, ValueError):
             return _DeviceMode.IDLE
 
+    def _is_returning(self) -> bool:
+        """True when the device is actively returning to the dock (sys_status RETURNING).
+
+        Finer-grained than ``device_mode()`` (which buckets WORKING and RETURNING both
+        into ACTIVE); used to shorten the BLE cooldown only during the return leg.
+        """
+        try:
+            return self.state_machine.current.raw.report_data.dev.sys_status == WorkMode.MODE_RETURNING.value  # type: ignore[union-attr]
+        except (AttributeError, TypeError):
+            return False
+
+    def _is_working(self) -> bool:
+        """True when actively mowing (sys_status WORKING) — the narrow "active" used to
+        arm the resume-window.
+
+        ``device_mode()``'s ACTIVE also covers RETURNING / PAUSE / CHARGING_PAUSE, so a
+        long pause (e.g. parked mid-job overnight, CHARGING_PAUSE) kept ``_mowing_active_since``
+        set for ~14 h and the resume window never re-armed on the next fresh mow start
+        (observed 2026-07-27).  Gating the resume window on WORKING re-arms it per fresh mow.
+        """
+        try:
+            return self.state_machine.current.raw.report_data.dev.sys_status == WorkMode.MODE_WORKING.value  # type: ignore[union-attr]
+        except (AttributeError, TypeError):
+            return False
+
+    def _recently_docked(self) -> bool:
+        """True within ``_RECENT_DOCK_WINDOW`` after the poll loop first saw a DOCKED mode.
+
+        Keeps the fast BLE cooldown active during the dock-settling window (BLE may
+        flap right after docking) — ``_docked_since`` is set/reset in
+        ``mqtt_loop.poll_interval``.
+        """
+        return self._docked_since != 0.0 and (time.monotonic() - self._docked_since) < _RECENT_DOCK_WINDOW
+
+    def _ble_cooldown_seconds_override(self) -> float | None:
+        """Cooldown-duration override for the BLE transport (see ``set_cooldown_seconds_provider``).
+
+        Returns the short fast-cooldown while Luba is heading back to the dock
+        (``_is_returning``) or just settled on it (``_recently_docked``) — so a failed
+        connect doesn't lock BLE out for the full 120 s default in exactly the window
+        where we most want a fast re-grab; None otherwise (transport keeps its default).
+        """
+        return _FAST_BLE_COOLDOWN_SECONDS if (self._is_returning() or self._recently_docked()) else None
+
+    @property
+    def battery_percent(self) -> int | None:
+        """Current battery level (0-100), or None if not yet reported.
+
+        Read from the same report field as ``device_mode``; used by
+        ``mqtt_loop.poll_interval`` for the low-battery dense-cadence overlay.
+        """
+        try:
+            return int(self.state_machine.current.raw.report_data.dev.battery_val)  # type: ignore[union-attr]
+        except (AttributeError, TypeError, ValueError):
+            return None
+
+    @property
+    def work_progress(self) -> int | None:
+        """Current mowing-task progress percentage (0-100), or None if unavailable.
+
+        High 16 bits of ``report_data.work.area`` — the SAME field the HA ``progress``
+        (%) sensor reads (``work.area >> 16``).  NOTE the Mammotion field naming is a
+        trap: ``report_data.work.progress`` is NOT the percentage but a packed *time*
+        field (low16 = total_time minutes, high16 = left_time); reading it here made
+        near-end fire on a minutes value (375) mistaken for a percent (2026-07-26
+        investigation).  Used by ``mqtt_loop.poll_interval`` for the near-end
+        dense-cadence overlay — poll faster as a program approaches completion.
+        """
+        try:
+            return int(self.state_machine.current.raw.report_data.work.area) >> 16  # type: ignore[union-attr]
+        except (AttributeError, TypeError, ValueError):
+            return None
+
     def in_no_request_mode(self) -> bool:
         """True when the device is in a mode where polling sends are unwelcome.
 
@@ -1314,9 +1417,31 @@ class DeviceHandle:
         """Return the MQTT one-shot poll interval based on current device mode.
 
         Thin wrapper kept on the handle for tests; actual cadence table lives
-        in :mod:`pymammotion.device.mqtt_loop`.
+        in :mod:`pymammotion.device.mqtt_loop`.  Discards the reason string —
+        callers that need it use :attr:`last_poll_reason` / read the tuple directly.
         """
-        return poll_interval(self)
+        return poll_interval(self)[0]
+
+    @property
+    def last_poll_sleep_seconds(self) -> float:
+        """Seconds the MQTT activity loop is currently sleeping (diagnostic).
+
+        Reflects the loop's *last actual* sleep — the selected ``poll_interval``
+        when it is waiting to poll, or a defer duration (BLE stream feeding, no
+        usable transport, rate-limited, …) — paired with :attr:`last_poll_reason`.
+        """
+        return self._last_poll_sleep_seconds
+
+    @property
+    def last_poll_reason(self) -> str:
+        """Why the MQTT activity loop chose its current sleep (diagnostic).
+
+        Overlay name (``base:<mode>``, ``resume-window``, ``low-battery``,
+        ``near-end``) when polling, or a defer state (``ble-stream-active``,
+        ``no-usable-transport(...)``, ``rate-limited-no-ble``, ``saga-or-no-request``,
+        ``no-transports``) — see :attr:`last_poll_sleep_seconds`.
+        """
+        return self._last_poll_reason
 
     # ------------------------------------------------------------------
     # Public report-cfg API (used by MammotionClient / HA via client.py)
