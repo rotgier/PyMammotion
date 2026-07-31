@@ -982,6 +982,17 @@ def rpt_handle(monkeypatch: pytest.MonkeyPatch) -> DeviceHandle:
     h.device_name = "Luba-TEST"
     h.broker = MagicMock()
     h.broker.send_and_wait = AsyncMock()
+    # RPT-verify streak counters the helper reads/writes (normally set in __init__,
+    # which this fixture bypasses).
+    h._rpt_fail_streak = 0
+    h._rpt_fail_since_data = 0
+    h._last_report_ok_ts = 0.0
+    # The helper publishes on the state-changed bus after updating RPT health,
+    # so the bus + state_machine + stopping flag must exist on the bare handle.
+    h._stopping = False
+    h.state_machine = MagicMock()
+    h._state_changed_bus = MagicMock()
+    h._state_changed_bus.emit = AsyncMock()
     mocked_commands = MagicMock()
     mocked_commands.send_todev_ble_sync = MagicMock(return_value=b"\xAAsync")
     monkeypatch.setattr(DeviceHandle, "commands", property(lambda self: mocked_commands))
@@ -1005,6 +1016,8 @@ async def test_success_returns_true_and_sends_once(rpt_handle: DeviceHandle) -> 
     assert result is True
     # send_fn ran once → transport_send called once with cmd_bytes (no ble_sync)
     transport_send.assert_awaited_once_with(cmd_bytes)
+    # Success publishes on the state-changed bus so subscribers re-read RPT health.
+    rpt_handle._state_changed_bus.emit.assert_awaited()  # noqa: SLF001
 
 
 async def test_retry_prefixes_ble_sync_then_cmd(rpt_handle: DeviceHandle) -> None:
@@ -1046,6 +1059,9 @@ async def test_command_timeout_returns_false(rpt_handle: DeviceHandle) -> None:
     result = await rpt_handle._send_rpt_start_verified(cmd_bytes, transport_send)
 
     assert result is False
+    # A timeout bumps the streak and must publish so the freeze sensor updates
+    # promptly instead of waiting for the next periodic coordinator refresh.
+    rpt_handle._state_changed_bus.emit.assert_awaited()  # noqa: SLF001
 
 
 async def test_concurrent_request_falls_back_to_plain_send(rpt_handle: DeviceHandle) -> None:

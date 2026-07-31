@@ -1270,6 +1270,91 @@ class MammotionClient:
         if len(failures) == len(refreshers):
             raise failures[0]
 
+    async def refresh_cloud_session(self, device_name: str) -> bool:
+        """Heal a silent cloud freeze (blank identityId 29003 / stale iotToken) in place.
+
+        Mirrors the on-auth-failure recovery (``_on_aliyun_auth_failure``) but is
+        callable on demand (e.g. from a HA button) rather than only on an explicit
+        2043/460 bind rejection — which a *silent* freeze (sends fine, no responses,
+        no error raised) never triggers. Targeted Aliyun credential refresh
+        (re-mint iotToken) then re-apply it to the live transport so
+        ``toapp_report_data`` routes again — WITHOUT a full config-entry reload.
+        Escalates to a full re-login only if the refreshToken is also exhausted.
+
+        Returns True on success.
+        """
+        session = self._get_default_session()
+        handle = self._device_registry.get_by_name(device_name)
+        if session is None or session.token_manager is None or handle is None:
+            _logger.warning("refresh_cloud_session[%s]: no session/handle available", device_name)
+            return False
+        transport = handle.get_transport(TransportType.CLOUD_ALIYUN)
+        if transport is None:
+            _logger.warning("refresh_cloud_session[%s]: no Aliyun transport", device_name)
+            return False
+        tm = session.token_manager
+        try:
+            await tm.refresh_aliyun_credentials()
+            creds = await tm.get_aliyun_credentials()
+            transport.update_iot_token(creds.iot_token)
+            _logger.info("refresh_cloud_session[%s]: Aliyun iotToken re-minted + applied to transport", device_name)
+            return True
+        except ReLoginRequiredError:
+            _logger.warning("refresh_cloud_session[%s]: refreshToken exhausted — escalating to full re-login", device_name)
+        try:
+            await self._full_relogin(session, transport_type=TransportType.CLOUD_ALIYUN)
+            creds = await tm.get_aliyun_credentials()
+            transport.update_iot_token(creds.iot_token)
+            _logger.info("refresh_cloud_session[%s]: recovered via full re-login", device_name)
+            return True
+        except Exception:
+            _logger.exception("refresh_cloud_session[%s]: full re-login failed", device_name)
+            return False
+
+    async def reconnect_cloud_transport(self, device_name: str) -> bool:
+        """Heal a silent downlink freeze by bouncing the Aliyun MQTT transport in place.
+
+        For the freeze mode where SENDS still succeed (HTTP 200, iotToken valid)
+        but device reports stop routing back: the broker connection looks alive
+        (``is_connected`` True), so the transport's own reconnect-on-drop never
+        fires.  Force a fresh connection — ``disconnect`` cancels the wedged
+        receive loop, ``connect`` starts a new one that re-subscribes to the
+        report topics and re-sends the bind, reusing the current (valid) iotToken.
+        No credential refresh, no re-login — use ``refresh_cloud_session`` for the
+        29003 / token-expiry mode instead.
+
+        Returns True if the transport was bounced.
+        """
+        handle = self._device_registry.get_by_name(device_name)
+        if handle is None:
+            _logger.warning("reconnect_cloud_transport[%s]: no handle available", device_name)
+            return False
+        transport = handle.get_transport(TransportType.CLOUD_ALIYUN)
+        if transport is None:
+            _logger.warning("reconnect_cloud_transport[%s]: no Aliyun transport", device_name)
+            return False
+        if transport.is_unrecoverable_auth_failure:
+            # connect() refuses once the re-login breaker has tripped — bouncing
+            # would only leave the transport disconnected.  That is an auth death,
+            # not a downlink freeze: refresh_cloud_session / reload is the tool.
+            _logger.warning(
+                "reconnect_cloud_transport[%s]: transport in unrecoverable auth state — "
+                "use refresh_cloud_session or reload instead",
+                device_name,
+            )
+            return False
+        try:
+            await transport.disconnect()
+            await transport.connect()
+            _logger.info(
+                "reconnect_cloud_transport[%s]: Aliyun MQTT bounced — re-subscribed + re-bound",
+                device_name,
+            )
+            return True
+        except Exception:
+            _logger.exception("reconnect_cloud_transport[%s]: transport bounce failed", device_name)
+            return False
+
     # ------------------------------------------------------------------
     # Cloud — private helpers
     # ------------------------------------------------------------------

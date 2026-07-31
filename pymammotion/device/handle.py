@@ -273,6 +273,19 @@ class DeviceHandle:
         #: Monotonic timestamp of the last successfully-parsed inbound LubaMsg.
         #: Used by ensure_fresh_state to decide whether a snapshot poll is needed.
         self._last_report_at: float = 0.0
+        #: Silent-freeze detection (cloud-path): tracks the verified RPT_START
+        #: outcome specifically (toapp_report_data ack), NOT any LubaMsg like
+        #: _last_report_at — so it is immune to the junk-message masking that
+        #: makes _last_report_at/wifi_rssi unreliable freeze detectors.
+        #: Consecutive _send_rpt_start_verified() failures (reset to 0 on success).
+        self._rpt_fail_streak: int = 0
+        #: Diagnostic twin of _rpt_fail_streak: same +1-on-timeout / 0-on-success,
+        #: but ALSO reset to 0 by any inbound frame (see on_raw_message).  Lets us
+        #: compare, over time, how often a push kept data fresh while the
+        #: synchronous RPT_START failed.  Not wired to any control logic.
+        self._rpt_fail_since_data: int = 0
+        #: Wall-clock epoch (s) of the last verified RPT_START ack, 0.0 if none yet.
+        self._last_report_ok_ts: float = 0.0
         #: Snapshot of the previous active_transport selection / availability so
         #: the DEBUG log can suppress repeats — only the transitions matter.
         #: Tuple of (selection_path, prefer_ble, ble_usable, mqtt_usable).
@@ -570,6 +583,9 @@ class DeviceHandle:
         except (ValueError, KeyError):
             _logger.debug("← %s  <unparseable protobuf — unknown enum value>", self.device_name)
         self._last_report_at = time.monotonic()
+        # Diagnostic push-aware counter: a valid inbound frame is "fresh data",
+        # so reset it here (the strict _rpt_fail_streak deliberately does not).
+        self._rpt_fail_since_data = 0
 
         if self._availability.mqtt_reported_offline and transport_type != TransportType.BLE:
             self.update_availability(transport_type, self._availability.mqtt, mqtt_reported_offline=False)
@@ -1187,6 +1203,33 @@ class DeviceHandle:
         """Monotonic timestamp of the last received LubaMsg (0.0 if none yet)."""
         return self._last_report_at
 
+    @property
+    def rpt_consecutive_failures(self) -> int:
+        """Consecutive verified RPT_START failures (toapp_report_data no-acks).
+
+        Resets to 0 on the first successful ack. A sustained non-zero value is a
+        precise silent-freeze signal on the cloud report path — unlike
+        ``last_report_at``/wifi_rssi it is not bumped by unrelated LubaMsgs.
+        """
+        return self._rpt_fail_streak
+
+    @property
+    def rpt_failures_since_fresh_data(self) -> int:
+        """Diagnostic twin of ``rpt_consecutive_failures`` that ALSO resets on any
+        inbound frame (not only on a verified RPT ack).
+
+        Same +1-on-timeout / 0-on-success as the strict counter, plus a reset in
+        ``on_raw_message``.  Comparing the two over time shows how often a push
+        kept telemetry fresh while the synchronous RPT_START kept failing.  Not
+        wired to auto-heal — observation only.
+        """
+        return self._rpt_fail_since_data
+
+    @property
+    def last_report_ok_ts(self) -> float:
+        """Wall-clock epoch (s) of the last verified RPT_START ack (0.0 if none)."""
+        return self._last_report_ok_ts
+
     async def request_report_snapshot(self) -> None:
         """Fire a one-shot count=1 report — no-op while BLE continuous stream is active.
 
@@ -1289,12 +1332,26 @@ class DeviceHandle:
 
         try:
             await self.broker.send_and_wait(_send, expected_field="toapp_report_data")
+            self._rpt_fail_streak = 0
+            self._rpt_fail_since_data = 0
+            self._last_report_ok_ts = time.time()
+            # Publish so subscribers (e.g. the HA coordinator) re-read the
+            # RPT-health properties now.  The resolving frame is consumed by
+            # send_and_wait and never reaches the reducer, so without this the
+            # recovery isn't propagated until the next periodic refresh.
+            await self.emit_state_changed(self.state_machine.current)
             return True
         except CommandTimeoutError:
+            self._rpt_fail_streak += 1
+            self._rpt_fail_since_data += 1
             _logger.debug(
-                "RPT_START [%s]: no toapp_report_data ack — next poll tick will retry",
+                "RPT_START [%s]: no toapp_report_data ack (streak=%d) — next poll tick will retry",
                 self.device_name,
+                self._rpt_fail_streak,
             )
+            # A timeout is itself an observable state change (streak bumped) but
+            # produces no inbound frame, so publish explicitly to propagate it.
+            await self.emit_state_changed(self.state_machine.current)
             return False
         except ConcurrentRequestError:
             try:
