@@ -227,7 +227,9 @@ class DeviceOtherInfo(DataClassORJSONMixin):
     task_count: int
     task_hash: str
     systemio_boot_time: Annotated[str, Alias("systemioBootTime")]
-    dds_no_gdc: int
+    # fw 1.30.29.8 omits dds_no_gdc in deviceOtherInfo → default avoids MissingField
+    # (extends upstream #160 tolerance to this nested model).
+    dds_no_gdc: int = 0
     tilt_degree: str = ""
 
     class Config(BaseConfig):
