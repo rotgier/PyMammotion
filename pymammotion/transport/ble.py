@@ -192,6 +192,23 @@ class BLETransport(Transport):
             return False
         return time.monotonic() >= self._connect_cooldown_until
 
+    @property
+    def usable_reason(self) -> str:
+        """Diagnostic breakdown of :attr:`is_usable` — the reason routing does or
+        doesn't consider BLE.  MUST mirror ``is_usable``'s conditions in order.
+
+        Returns one of: ``"no_device"`` (no cached BLEDevice — no recent
+        advertisement), ``"weak_signal"`` (last RSSI below ``config.min_rssi``),
+        ``"cooldown"`` (in connect-failure cooldown), or ``"usable"``.
+        """
+        if self._ble_device is None:
+            return "no_device"
+        if self._last_rssi is not None and self._last_rssi < self._config.min_rssi:
+            return "weak_signal"
+        if time.monotonic() < self._connect_cooldown_until:
+            return "cooldown"
+        return "usable"
+
     # ------------------------------------------------------------------
     # Transport ABC
     # ------------------------------------------------------------------

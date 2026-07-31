@@ -165,7 +165,27 @@ async def ble_polling_loop(handle: DeviceHandle) -> None:
     try:
         while not handle._stopping:  # noqa: SLF001
             ble = handle._transports.get(TransportType.BLE)  # noqa: SLF001
+            # BLE-PROBE: per-tick heartbeat — confirms the loop is still iterating.
+            # If these stop while keepalive continues, the loop hung on an await below.
+            _logger.warning(
+                "BLE-PROBE [%s] tick: ble=%s is_connected=%s mode=%s interval=%s"
+                " stream_active=%s last_report_age=%.1fs",
+                handle.device_name,
+                ble is not None,
+                None if ble is None else ble.is_connected,
+                handle.device_mode().value if ble is not None else "?",
+                None if ble is None else _BLE_POLL_INTERVAL[handle.device_mode()],
+                handle.ble_stream_active,
+                (time.monotonic() - handle.last_report_at) if handle.last_report_at > 0 else -1,
+            )
             if ble is None or not ble.is_connected:
+                # BLE-PROBE: capture WHY the loop exits (vs silent hang above).
+                _logger.warning(
+                    "BLE-PROBE [%s] EXIT loop: ble_is_none=%s is_connected=%s",
+                    handle.device_name,
+                    ble is None,
+                    None if ble is None else ble.is_connected,
+                )
                 break
 
             mode = handle.device_mode()
@@ -210,6 +230,13 @@ async def ble_polling_loop(handle: DeviceHandle) -> None:
                         )
                     handle.ble_stream_active = False
 
+                # BLE-PROBE: bracket the stream renew/start await. If "enter" logs
+                # without a matching "done", the loop hung here (wedged BLE write on
+                # a half-dead GATT that never errors nor returns) — the suspected
+                # root cause of polling going silent on an unstable link.
+                _op = "RPT_KEEP" if handle.ble_stream_active else "RPT_START(count=0)"
+                _t0 = time.monotonic()
+                _logger.warning("BLE-PROBE [%s] stream-await ENTER: %s", handle.device_name, _op)
                 try:
                     if handle.ble_stream_active:
                         # Stream already running — send RPT_KEEP to renew the
@@ -222,23 +249,48 @@ async def ble_polling_loop(handle: DeviceHandle) -> None:
                         # verification fails the flag stays False and this
                         # branch retries on the next tick.
                         await handle._enqueue_ble_stream_command(RptAct.RPT_START, count=0)  # noqa: SLF001
-                except Exception:
-                    _logger.debug(
-                        "ble_polling [%s]: stream renew/start failed",
+                    _logger.warning(
+                        "BLE-PROBE [%s] stream-await DONE: %s (%.1fs)",
                         handle.device_name,
+                        _op,
+                        time.monotonic() - _t0,
+                    )
+                except Exception:
+                    _logger.warning(
+                        "BLE-PROBE [%s] stream-await EXC: %s (%.1fs)",
+                        handle.device_name,
+                        _op,
+                        time.monotonic() - _t0,
                         exc_info=True,
                     )
                 wait = _BLE_STREAM_RENEW_INTERVAL
             else:
                 now = time.monotonic()
-                if now - last_one_shot_at >= ble_interval and not handle.in_no_request_mode():
+                _due = now - last_one_shot_at >= ble_interval
+                _no_req = handle.in_no_request_mode()
+                # BLE-PROBE: why a count=1 poll does or doesn't fire this tick.
+                _logger.warning(
+                    "BLE-PROBE [%s] poll-branch: due=%s (since_last=%.1fs/%.0fs) no_request_mode=%s",
+                    handle.device_name,
+                    _due,
+                    now - last_one_shot_at,
+                    ble_interval,
+                    _no_req,
+                )
+                if _due and not _no_req:
+                    _t0 = time.monotonic()
+                    _logger.warning("BLE-PROBE [%s] one-shot ENTER", handle.device_name)
                     try:
                         await handle._send_one_shot_report(source="ble_poll")  # noqa: SLF001
                         last_one_shot_at = now
+                        _logger.warning(
+                            "BLE-PROBE [%s] one-shot DONE (%.1fs)", handle.device_name, time.monotonic() - _t0
+                        )
                     except Exception:
-                        _logger.debug(
-                            "ble_polling [%s]: one-shot enqueue failed",
+                        _logger.warning(
+                            "BLE-PROBE [%s] one-shot EXC (%.1fs)",
                             handle.device_name,
+                            time.monotonic() - _t0,
                             exc_info=True,
                         )
                 time_until_next_poll = ble_interval - (time.monotonic() - last_one_shot_at)
@@ -251,6 +303,10 @@ async def ble_polling_loop(handle: DeviceHandle) -> None:
             except asyncio.CancelledError:
                 break
     finally:
+        # BLE-PROBE: loop is ending — task will NOT restart until the next
+        # _on_ble_connected (successful reconnect). If we see this without a
+        # later "starting BLE polling loop", polling stays dead.
+        _logger.warning("BLE-PROBE [%s] polling loop ENDED (stopping=%s)", handle.device_name, handle._stopping)  # noqa: SLF001
         if handle.ble_stream_active:
             handle.ble_stream_active = False
             handle._rearm_event.set()  # noqa: SLF001
