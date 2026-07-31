@@ -79,6 +79,17 @@ _RPT_FAIL_BLE_RESET_THRESHOLD: int = 4
 #: reconnect+cooldown cycle is still settling.
 _BLE_FORCE_DISCONNECT_DEBOUNCE: float = 120.0
 
+#: How long ``start()`` holds the initial command burst off the cloud waiting for
+#: BLE to (re)connect — so a restart doesn't dump the boot burst over Aliyun (429
+#: pressure) when BLE is the preferred path.  Sized for the whole boot chain: ESP
+#: proxy reconnect + Luba re-advertising + BLEDevice cache/registration + GATT
+#: connect (realistically 10-25 s).  Low cost to be generous: only our outbound
+#: burst is held (inbound cloud pushes keep flowing), and the gate releases early
+#: on BLE-connect — the full window only bites when BLE never comes up.  Hard
+#: fallback: on timeout the burst goes over cloud, so a BLE-out-of-range boot
+#: never hangs.
+_BOOT_BLE_WAIT_TIMEOUT: float = 30.0
+
 #: Channels sent in one-shot (count=1) polls AND in the BLE continuous stream.
 _REPORT_CHANNELS: list[RptInfoType] = [
     RptInfoType.RIT_DEV_STA,
@@ -285,6 +296,11 @@ class DeviceHandle:
         #: cancel it and prevents the detached task from being garbage-collected mid-connect.
         self._ble_connect_task: asyncio.Task[None] | None = None
         self._ble_connect_lock: asyncio.Lock = asyncio.Lock()
+        #: Boot BLE-wait gate: while True the command queue is held so the initial
+        #: burst waits for BLE rather than firing over cloud (see ``start()``).
+        #: Released by ``_release_boot_ble_wait`` on BLE connect or the timeout.
+        self._boot_ble_wait: bool = False
+        self._boot_ble_wait_timer: asyncio.TimerHandle | None = None
         #: True while the BLE continuous (count=0) report stream is active.  The MQTT
         #: activity loop checks this and skips its own poll while the stream is feeding.
         self._ble_stream_active: bool = False
@@ -376,7 +392,10 @@ class DeviceHandle:
             if transport_type == TransportType.BLE:
                 if state == TransportAvailability.CONNECTED:
                     # BLE arriving while MQTT is reconnecting provides a fallback send path —
-                    # open the queue gate so commands can flow immediately over BLE.
+                    # open the queue gate so commands can flow immediately over BLE.  This
+                    # is also what releases the boot BLE-wait gate: the initial burst now
+                    # flows over BLE instead of cloud.
+                    self._release_boot_ble_wait("BLE connected")
                     self.queue.resume_after_reconnect()
                     asyncio.get_running_loop().create_task(self._on_ble_connected())
                 else:
@@ -420,11 +439,19 @@ class DeviceHandle:
                 # CONNECTED: subscription is live, commands can be dispatched normally.
                 # DISCONNECTED: don't hold commands indefinitely; let NoTransportAvailableError
                 # handle them if no other transport is available.
-                _logger.debug(
-                    "DeviceHandle[%s]: MQTT transport connected — resuming command dispatch",
-                    self.device_name,
-                )
-                self.queue.resume_after_reconnect()
+                # Hold off while the boot BLE-wait gate is armed — the initial burst
+                # should go over BLE (or wait for the fallback timer), not cloud.
+                if not self._boot_ble_wait:
+                    _logger.debug(
+                        "DeviceHandle[%s]: MQTT transport connected — resuming command dispatch",
+                        self.device_name,
+                    )
+                    self.queue.resume_after_reconnect()
+                else:
+                    _logger.debug(
+                        "DeviceHandle[%s]: MQTT connected but boot BLE-wait gate armed — holding burst for BLE",
+                        self.device_name,
+                    )
 
         return _handler
 
@@ -1060,8 +1087,74 @@ class DeviceHandle:
         """
         self._stopping = False
         self.queue.start()
+        # Boot BLE-wait gate: hold the initial command burst off the cloud until BLE
+        # (re)connects — a restart otherwise dumps the boot burst over Aliyun (429
+        # pressure).  Only when BLE is the preferred+registered path; the timer is a
+        # hard fallback so a BLE-out-of-range boot resumes (over cloud) after the window.
+        ble_registered = self._transports.get(TransportType.BLE) is not None
+        registered = [t.value for t in self._transports]
+        # Arm for any BLE-capable mower — gated on ``not _skips_activity_loops``, NOT
+        # on prefer_ble / ble_registered.  Cloud-registered handles are created with
+        # prefer_ble=False and start() runs BEFORE BLE is wired and prefer_ble is
+        # flipped True (verified in log 2026-07-26: burst went cloud before prefer_ble
+        # became True), so gating on prefer_ble skips the gate entirely.  Likewise BLE
+        # registers only seconds after start().  ``_skips_activity_loops`` is the one
+        # stable "this device uses BLE" signal available at start() (False for mowers,
+        # True for RTK base / Spino).  Hold on that; the timer falls back to cloud —
+        # so a BLE-disabled mower eats one _BOOT_BLE_WAIT_TIMEOUT before cloud (rare).
+        if not self._skips_activity_loops:
+            self._boot_ble_wait = True
+            self.queue.pause_for_reconnect()
+            self._boot_ble_wait_timer = asyncio.get_running_loop().call_later(
+                _BOOT_BLE_WAIT_TIMEOUT,
+                self._release_boot_ble_wait,
+                "timeout — BLE not up in time, falling back to cloud",
+            )
+            _logger.warning(
+                "start [%s]: boot BLE-wait gate ARMED (%.0fs) — prefer_ble=%s ble_registered=%s transports=%s",
+                self.device_name,
+                _BOOT_BLE_WAIT_TIMEOUT,
+                self.prefer_ble,
+                ble_registered,
+                registered,
+            )
+        else:
+            # RTK base / Spino — no BLE loops, no gate; burst goes cloud.
+            _logger.warning(
+                "start [%s]: boot BLE-wait gate NOT armed — skips_activity_loops (RTK/Spino) transports=%s",
+                self.device_name,
+                registered,
+            )
         if not self._skips_activity_loops and (self._keep_alive_task is None or self._keep_alive_task.done()):
             self._keep_alive_task = asyncio.get_running_loop().create_task(mqtt_activity_loop(self))
+
+    def _release_boot_ble_wait(self, reason: str) -> None:
+        """Release the boot BLE-wait gate (see ``start()``) and resume the queue.
+
+        Idempotent — called on BLE connect and by the fallback timer; whichever
+        fires first releases, the other is a no-op.
+        """
+        if not self._boot_ble_wait:
+            return
+        self._boot_ble_wait = False
+        if self._boot_ble_wait_timer is not None:
+            self._boot_ble_wait_timer.cancel()
+            self._boot_ble_wait_timer = None
+        # Only lift the queue gate if a transport is actually ready to send.  On a
+        # BLE-connect release BLE is up.  On the timeout fallback, resume only if
+        # cloud has connected by now — otherwise leave the gate closed and let the
+        # MQTT availability handler resume it on CONNECTED, so we never dispatch the
+        # burst into NoTransportAvailableError.  (The gate is a single boolean Event,
+        # so once _boot_ble_wait is False the MQTT-CONNECTED branch will resume.)
+        if self.has_usable_transport:
+            _logger.debug("boot BLE-wait released [%s]: %s — resuming command dispatch", self.device_name, reason)
+            self.queue.resume_after_reconnect()
+        else:
+            _logger.debug(
+                "boot BLE-wait released [%s]: %s — no usable transport yet, awaiting MQTT CONNECTED",
+                self.device_name,
+                reason,
+            )
         # _dynamics_line_task is BLE-gated and starts/stops from _on_ble_connected
         # / the BLE availability handler — not from start().  Dynamics-line polling
         # only makes sense over BLE (10 s cadence would be MQTT-quota-expensive).
@@ -1124,6 +1217,10 @@ class DeviceHandle:
     async def stop(self) -> None:
         """Stop the command queue, broker, debounce task, and disconnect all transports."""
         self._stopping = True
+        self._boot_ble_wait = False
+        if self._boot_ble_wait_timer is not None:
+            self._boot_ble_wait_timer.cancel()
+            self._boot_ble_wait_timer = None
         if self._report_stream_timer is not None:
             self._report_stream_timer.cancel()
             self._report_stream_timer = None
