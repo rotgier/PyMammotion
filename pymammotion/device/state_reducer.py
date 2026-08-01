@@ -101,11 +101,6 @@ if TYPE_CHECKING:
 
 _logger = logging.getLogger(__name__)
 
-# PROBE (garden research 2026-06-13): confirm THIS file (the /share editable
-# clone) is the loaded pymammotion, not the pip-installed 0.8.5. Logs the
-# resolved path once at import. Remove with the rest of the probe.
-_logger.warning("PROBE: pymammotion state_reducer loaded from %s", __file__)
-
 
 class StateReducer(ABC):
     """Abstract base class for device state reducers.
@@ -257,16 +252,6 @@ class MowerStateReducer(StateReducer):
                     case "mow_to_app_info":
                         pass  # mow_info() is a no-op — nothing to copy.
                     case _:
-                        # PROBE (garden research 2026-06-13): surface every sys
-                        # sub-message we DON'T handle — looking for a live
-                        # "why blocked / will resume" discriminator (e.g.
-                        # toapp_err_code). Remove once the question is answered.
-                        _logger.warning("PROBE unhandled sys msg: %s", sys_msg_name)
-                        if sys_msg_name == "toapp_err_code":
-                            _logger.warning(
-                                "PROBE toapp_err_code content: %s",
-                                message.sys.toapp_err_code,  # type: ignore[union-attr]
-                            )
                         device.mower_state = copy.deepcopy(current.mower_state)
                         device.device_firmwares = copy.deepcopy(current.device_firmwares)
                 self._update_sys_data(device, message)
