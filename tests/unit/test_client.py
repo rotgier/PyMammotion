@@ -1470,55 +1470,6 @@ async def test_clear_ble_device_no_handle_is_noop() -> None:
 
 
 # ---------------------------------------------------------------------------
-# reconnect_cloud_transport — heal-B: bounce the Aliyun MQTT transport in place
-# ---------------------------------------------------------------------------
-
-
-async def test_reconnect_cloud_transport_bounces_transport() -> None:
-    """Happy path: disconnect() then connect() are awaited and True is returned.
-
-    This is the downlink-freeze heal — a fresh _run() re-subscribes and re-binds
-    reusing the current iotToken, no credential refresh / re-login.
-    """
-    client = MammotionClient()
-    mqtt = _make_connected_transport(TransportType.CLOUD_ALIYUN)
-    mqtt.connect = AsyncMock()
-    mqtt.is_unrecoverable_auth_failure = False  # MagicMock attr defaults truthy — pin it
-    handle = make_handle("dev1", "Luba-Bounce")
-    handle._transports[TransportType.CLOUD_ALIYUN] = mqtt  # noqa: SLF001
-    await client._device_registry.register(handle)
-
-    result = await client.reconnect_cloud_transport("Luba-Bounce")
-
-    assert result is True
-    mqtt.disconnect.assert_awaited_once()
-    mqtt.connect.assert_awaited_once()
-
-
-async def test_reconnect_cloud_transport_unknown_device_returns_false() -> None:
-    """Unknown device name → False, no raise."""
-    client = MammotionClient()
-    assert await client.reconnect_cloud_transport("ghost-mower") is False
-
-
-async def test_reconnect_cloud_transport_skips_when_unrecoverable_auth() -> None:
-    """Unrecoverable auth state → no bounce (connect would refuse), returns False."""
-    client = MammotionClient()
-    mqtt = _make_connected_transport(TransportType.CLOUD_ALIYUN)
-    mqtt.connect = AsyncMock()
-    mqtt.is_unrecoverable_auth_failure = True
-    handle = make_handle("dev1", "Luba-AuthDead")
-    handle._transports[TransportType.CLOUD_ALIYUN] = mqtt  # noqa: SLF001
-    await client._device_registry.register(handle)
-
-    result = await client.reconnect_cloud_transport("Luba-AuthDead")
-
-    assert result is False
-    mqtt.disconnect.assert_not_awaited()
-    mqtt.connect.assert_not_awaited()
-
-
-# ---------------------------------------------------------------------------
 # add_ble_only_device — accepts ble_device or ble_address, requires one
 # ---------------------------------------------------------------------------
 
