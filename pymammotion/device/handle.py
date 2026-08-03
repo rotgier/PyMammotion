@@ -921,6 +921,11 @@ class DeviceHandle:
         on_complete: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         """Enqueue a saga for exclusive execution."""
+        # An explicit saga is a deliberate "do this now" request, not part of the
+        # automatic startup poll burst the boot-gate suppresses.  Release the gate
+        # so the saga dispatches immediately instead of waiting for BLE/timeout.
+        if self._boot_ble_wait:
+            self._release_boot_ble_wait("explicit saga enqueued")
         await self.queue.enqueue_saga(saga, self.broker, on_complete=on_complete)
 
     def has_queued_commands(self) -> bool:
