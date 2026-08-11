@@ -987,6 +987,12 @@ def rpt_handle(monkeypatch: pytest.MonkeyPatch) -> DeviceHandle:
     h._rpt_fail_streak = 0
     h._rpt_fail_since_data = 0
     h._last_report_ok_ts = 0.0
+    # BLE freeze-escalation ladder state the helper reads/writes (set in __init__,
+    # which this fixture bypasses).
+    h._ble_reset_fired = set()
+    h._ble_given_up = False
+    h._last_ble_giveup_at = 0.0
+    h._last_ble_giveup_reason = ""
     # The helper publishes on the state-changed bus after updating RPT health,
     # so the bus + state_machine + stopping flag must exist on the bare handle.
     h._stopping = False
@@ -1062,6 +1068,34 @@ async def test_command_timeout_returns_false(rpt_handle: DeviceHandle) -> None:
     # A timeout bumps the streak and must publish so the freeze sensor updates
     # promptly instead of waiting for the next periodic coordinator refresh.
     rpt_handle._state_changed_bus.emit.assert_awaited()  # noqa: SLF001
+
+
+async def test_ble_freeze_ladder_resets_at_3_and_6_then_gives_up_at_9(rpt_handle: DeviceHandle) -> None:
+    """since_data ladder: force BLE reset at 3 & 6 (once each), give up at 9, then stop.
+
+    Guards the 2026-08-11 fix: a wedged connected-but-silent BLE link must escalate
+    reset -> reset -> give-up (demote to cloud) instead of resetting forever.
+    """
+    reset_at: list[int] = []
+    giveup_at: list[int] = []
+    rpt_handle.schedule_ble_reset = MagicMock(  # noqa: SLF001
+        side_effect=lambda reason: reset_at.append(rpt_handle._rpt_fail_since_data)  # noqa: SLF001
+    )
+
+    def _giveup(reason: str) -> None:
+        giveup_at.append(rpt_handle._rpt_fail_since_data)  # noqa: SLF001
+        rpt_handle._ble_given_up = True  # mirror real _give_up_ble stopping the ladder  # noqa: SLF001
+
+    rpt_handle._give_up_ble = MagicMock(side_effect=_giveup)  # noqa: SLF001
+    rpt_handle.broker.send_and_wait.side_effect = CommandTimeoutError("toapp_report_data", 2)
+    transport_send = AsyncMock()
+
+    for _ in range(12):
+        await rpt_handle._send_rpt_start_verified(b"\xBBcmd", transport_send)
+
+    assert reset_at == [3, 6]  # reset fired once at each threshold, not every tick
+    assert giveup_at == [9]  # give-up fired once at the give-up threshold
+    assert rpt_handle._give_up_ble.call_count == 1  # noqa: SLF001 — no churn past give-up
 
 
 async def test_concurrent_request_falls_back_to_plain_send(rpt_handle: DeviceHandle) -> None:

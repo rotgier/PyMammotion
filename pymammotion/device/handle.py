@@ -61,23 +61,26 @@ _T = TypeVar("_T")
 #: (heartbeats are quota-free; see ``Transport.send_heartbeat``).
 _MQTT_SYNC_INTERVAL: float = 7.0
 
-#: Total-freeze escalation: verified-RPT_START timeouts with NO fresh inbound
-#: frame from any transport in between (``_rpt_fail_since_data``, which resets on
-#: any LubaMsg incl. cloud pushes) after which we force a BLE reset.  Gated on
-#: ``_rpt_fail_since_data`` rather than the strict ``_rpt_fail_streak`` on
-#: purpose: the strict streak climbs even while the cloud/MQTT path delivers data
-#: fine (Luba stays BLE-connected but silent on BLE polls — verified live
-#: 2026-07-25), and resetting BLE there only churns the link.  A verified
-#: RPT_START already retries internally (1 s x 2), so each count is a *hard*
-#: failure; 4 in a row with zero data from ANY path is a genuine total freeze.
-#: DOCKED_CHARGING polls at 60 s -> ~4 min; the continuous re-establish path
-#: bumps the same counter every ``_BLE_STREAM_RENEW_INTERVAL`` so a mowing freeze
-#: escalates in ~30-40 s.
-_RPT_FAIL_BLE_RESET_THRESHOLD: int = 4
-#: Debounce between forced BLE resets, aligned with the BLE connect cooldown
-#: (``BLETransport.connect_cooldown_seconds``) so a reset isn't re-fired while a
-#: reconnect+cooldown cycle is still settling.
-_BLE_FORCE_DISCONNECT_DEBOUNCE: float = 120.0
+#: Total-freeze escalation LADDER on verified-RPT_START timeouts with NO fresh
+#: inbound frame from any transport in between (``_rpt_fail_since_data``, which
+#: resets on any LubaMsg incl. cloud pushes).  Gated on ``_rpt_fail_since_data``
+#: not the strict ``_rpt_fail_streak`` on purpose: the strict streak climbs even
+#: while the cloud/MQTT path delivers data fine (Luba BLE-connected but silent on
+#: BLE polls — verified live 2026-07-25) and resetting BLE there only churns.
+#:
+#: Ladder (2026-08-11): force a BLE reset at each of ``_BLE_RESET_THRESHOLDS`` —
+#: covers the RECOVERABLE case (stale HA-side link; a reconnect may revive it) —
+#: then at ``_BLE_GIVEUP_THRESHOLD`` GIVE UP: mark BLE unusable for
+#: ``_BLE_GIVEUP_COOLDOWN`` so ``active_transport`` falls to cloud, and stop
+#: resetting.  Both connected-but-silent incidents (2026-08-05, 2026-08-11) were
+#: Luba-side wedges that only a physical power-cycle of Luba fixed — reconnecting
+#: forever never recovers it and only stresses Luba's BLE + the ESP proxy, so past
+#: the give-up point we stop, lean on cloud, and (HA side) tell the user once to
+#: power-cycle Luba.  Re-armed when fresh data returns (counters reset) or the
+#: cooldown expires (BLE retried once more → re-ladders).
+_BLE_RESET_THRESHOLDS: tuple[int, ...] = (3, 6)
+_BLE_GIVEUP_THRESHOLD: int = 9
+_BLE_GIVEUP_COOLDOWN: float = 1800.0
 
 #: How long ``start()`` holds the initial command burst off the cloud waiting for
 #: BLE to (re)connect — so a restart doesn't dump the boot burst over Aliyun (429
@@ -356,6 +359,17 @@ class DeviceHandle:
         #: fires.  0.0 / "" if none yet.
         self._last_ble_force_reset_at: float = 0.0
         self._last_ble_force_reset_reason: str = ""
+        #: BLE freeze-escalation ladder episode state (see _BLE_RESET_THRESHOLDS /
+        #: _BLE_GIVEUP_THRESHOLD).  ``_ble_reset_fired`` remembers which reset
+        #: thresholds already fired this episode (fire once each); both are cleared
+        #: when fresh data returns (counters reset).  ``_ble_given_up`` blocks further
+        #: resets after give-up until re-armed.
+        self._ble_reset_fired: set[int] = set()
+        self._ble_given_up: bool = False
+        #: Wall-clock epoch (s) + reason of the last BLE give-up, surfaced to HA so a
+        #: notify automation can alert ONCE ("power-cycle Luba") instead of per-reset.
+        self._last_ble_giveup_at: float = 0.0
+        self._last_ble_giveup_reason: str = ""
         #: Snapshot of the previous active_transport selection / availability so
         #: the DEBUG log can suppress repeats — only the transitions matter.
         #: Tuple of (selection_path, prefer_ble, ble_usable, mqtt_usable).
@@ -669,7 +683,10 @@ class DeviceHandle:
         self._last_report_at = time.monotonic()
         # Diagnostic push-aware counter: a valid inbound frame is "fresh data",
         # so reset it here (the strict _rpt_fail_streak deliberately does not).
+        # Fresh data == recovery, so re-arm the BLE freeze-escalation ladder.
         self._rpt_fail_since_data = 0
+        self._ble_reset_fired.clear()
+        self._ble_given_up = False
 
         if self._availability.mqtt_reported_offline and transport_type != TransportType.BLE:
             self.update_availability(transport_type, self._availability.mqtt, mqtt_reported_offline=False)
@@ -1494,6 +1511,16 @@ class DeviceHandle:
         """Reason string of the last forced BLE reset ('' if none yet)."""
         return self._last_ble_force_reset_reason
 
+    @property
+    def last_ble_giveup_at(self) -> float:
+        """Wall-clock epoch (s) of the last BLE give-up (ladder exhausted), 0.0 if none."""
+        return self._last_ble_giveup_at
+
+    @property
+    def last_ble_giveup_reason(self) -> str:
+        """Reason string of the last BLE give-up ('' if none yet)."""
+        return self._last_ble_giveup_reason
+
     async def request_report_snapshot(self) -> None:
         """Fire a one-shot count=1 report — no-op while BLE continuous stream is active.
 
@@ -1605,6 +1632,8 @@ class DeviceHandle:
             _logger.debug("RPT_START [%s] (source=%s): ack OK — counters reset", self.device_name, source)
             self._rpt_fail_streak = 0
             self._rpt_fail_since_data = 0
+            self._ble_reset_fired.clear()  # recovery → re-arm the freeze-escalation ladder
+            self._ble_given_up = False
             self._last_report_ok_ts = time.time()
             # Publish so subscribers (e.g. the HA coordinator) re-read the
             # RPT-health properties now.  The resolving frame is consumed by
@@ -1622,20 +1651,19 @@ class DeviceHandle:
                 self._rpt_fail_streak,
                 self._rpt_fail_since_data,
             )
-            if self._rpt_fail_since_data >= _RPT_FAIL_BLE_RESET_THRESHOLD:
-                # Genuine TOTAL freeze: verified RPT_STARTs keep timing out AND no
-                # inbound frame has arrived over ANY transport since (that's what
-                # _rpt_fail_since_data tracks — it resets on any LubaMsg, incl.
-                # cloud pushes).  We gate on it, NOT _rpt_fail_streak, because the
-                # strict streak climbs even while the cloud/MQTT path is happily
-                # delivering data — force-resetting BLE there just churns the link
-                # (Luba stays connected but silent on BLE polls; a reconnect
-                # doesn't make it answer, and telemetry is fine via cloud anyway).
-                # Only when NOTHING is flowing is a BLE reset warranted: reconnect
-                # to a (possibly re-advertising) Luba, or fall through to MQTT.
-                # No-op unless BLE is the stale-connected transport — see
-                # schedule_ble_reset.
-                self.schedule_ble_reset(reason=f"no data, rpt fails={self._rpt_fail_since_data}")
+            # Total-freeze escalation ladder.  Gated on _rpt_fail_since_data (NOT the
+            # strict streak): it resets on any LubaMsg incl. cloud pushes, so it only
+            # climbs when NOTHING is flowing over ANY transport — a genuine total
+            # freeze.  Reset BLE at each _BLE_RESET_THRESHOLDS (recoverable stale
+            # HA-side link may revive on reconnect); GIVE UP at _BLE_GIVEUP_THRESHOLD
+            # (Luba-side wedge — reconnecting forever never recovers, only churns).
+            since = self._rpt_fail_since_data
+            if not self._ble_given_up:
+                if since in _BLE_RESET_THRESHOLDS and since not in self._ble_reset_fired:
+                    self._ble_reset_fired.add(since)
+                    self.schedule_ble_reset(reason=f"no data, rpt fails={since}")
+                elif since >= _BLE_GIVEUP_THRESHOLD:
+                    self._give_up_ble(reason=f"no data after {since} RPT fails")
             # A timeout is itself an observable state change (streak bumped) but
             # produces no inbound frame, so publish explicitly to propagate it.
             await self.emit_state_changed(self.state_machine.current)
@@ -1947,19 +1975,16 @@ class DeviceHandle:
         (or this method's own ``schedule_ble_connection``) brings BLE back, with
         ``active_transport`` falling through to MQTT meanwhile.
 
-        Single-flight + debounced (``_BLE_FORCE_DISCONNECT_DEBOUNCE``, aligned
-        with the connect cooldown) so a reset isn't re-fired while a
-        reconnect+cooldown cycle is still settling.  No-op unless BLE is actually
-        the stale-connected transport — if BLE is already disconnected the freeze
-        is on MQTT and a BLE reset wouldn't help.
+        Fire-once-per-threshold is enforced by the caller's ladder
+        (``_ble_reset_fired`` — see the RPT timeout branch), so no time-debounce is
+        needed here.  No-op unless BLE is actually the stale-connected transport —
+        if BLE is already disconnected the freeze is on MQTT and a BLE reset
+        wouldn't help.
         """
         ble = self._transports.get(TransportType.BLE)
         if ble is None or not ble.is_connected:
             return
-        now = time.monotonic()
-        if now - self._last_ble_force_disconnect_ts < _BLE_FORCE_DISCONNECT_DEBOUNCE:
-            return
-        self._last_ble_force_disconnect_ts = now
+        self._last_ble_force_disconnect_ts = time.monotonic()
         self._last_ble_force_reset_at = time.time()
         self._last_ble_force_reset_reason = reason
         _logger.warning(
@@ -1988,6 +2013,46 @@ class DeviceHandle:
         # Kick a fresh connect immediately rather than waiting for the next send —
         # single-flight inside schedule_ble_connection guards against duplication.
         self.schedule_ble_connection(ble)
+
+    def _give_up_ble(self, reason: str) -> None:
+        """Give up on a wedged BLE link past ``_BLE_GIVEUP_THRESHOLD``.
+
+        Both connected-but-silent incidents (2026-08-05, 2026-08-11) were Luba-side
+        wedges that only a physical power-cycle of Luba fixed — reconnecting forever
+        never recovers and only stresses Luba's BLE + the ESP proxy.  So we DEMOTE
+        BLE: ``arm_cooldown`` makes ``is_usable`` False so ``active_transport`` falls
+        to cloud and reconnect paths stop retrying; force-disconnect WITHOUT
+        reconnect (unlike ``_force_ble_reset`` — we want to stay off BLE, not churn);
+        set ``_ble_given_up`` so the ladder stops.  Re-armed when fresh data returns
+        (counters reset) or the cooldown expires (BLE retried once more).  Stamped
+        for the HA notify (fired ONCE: "power-cycle Luba").
+        """
+        self._ble_given_up = True
+        self._last_ble_giveup_at = time.time()
+        self._last_ble_giveup_reason = reason
+        _logger.warning(
+            "DeviceHandle[%s]: giving up on BLE (%s) — marking unusable %.0fs, routing via cloud; "
+            "power-cycle Luba to recover",
+            self.device_name,
+            reason,
+            _BLE_GIVEUP_COOLDOWN,
+        )
+        ble = self._transports.get(TransportType.BLE)
+        if ble is None:
+            return
+        ble_t = cast(BLETransport, ble)
+        ble_t.arm_cooldown(_BLE_GIVEUP_COOLDOWN)
+        if ble_t.is_connected:
+            asyncio.get_running_loop().create_task(self._disconnect_ble_only(ble_t))
+
+    async def _disconnect_ble_only(self, ble: BLETransport) -> None:
+        """Detached BLE disconnect with NO reconnect (give-up path — stay on cloud)."""
+        try:
+            await ble.disconnect()
+        except Exception:  # noqa: BLE001 — detached task must swallow everything
+            _logger.warning(
+                "DeviceHandle[%s]: give-up BLE disconnect failed", self.device_name, exc_info=True
+            )
 
     async def send_raw(self, payload: bytes, *, prefer_ble: bool | None = None) -> None:
         """Send raw bytes via the best available transport, with BLE fallback on offline."""

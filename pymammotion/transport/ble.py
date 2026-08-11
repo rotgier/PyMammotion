@@ -183,6 +183,19 @@ class BLETransport(Transport):
         """
         self._cooldown_seconds_provider = provider
 
+    def arm_cooldown(self, seconds: float) -> None:
+        """Force this transport unusable (``is_usable`` -> False) for ``seconds``.
+
+        Unlike the connect-failure cooldown (armed internally by ``_note_connect_failure``),
+        this is an explicit demotion the owning handle uses after the RPT give-up
+        threshold: a wedged-but-``is_connected`` BLE link that never delivers report
+        data.  Marking it unusable makes ``active_transport`` fall through to cloud and
+        keeps the reconnect paths (gated on ``is_usable``) from retrying until the
+        cooldown expires or a fresh advertisement arrives — so we stop churning a link
+        only a physical Luba power-cycle can revive.
+        """
+        self._connect_cooldown_until = time.monotonic() + seconds
+
     @property
     def ble_address(self) -> str | None:
         """Address of the cached BLEDevice, or None if no device is set."""
