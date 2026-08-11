@@ -2054,6 +2054,24 @@ class DeviceHandle:
                 "DeviceHandle[%s]: give-up BLE disconnect failed", self.device_name, exc_info=True
             )
 
+    def retry_ble_now(self) -> None:
+        """Re-arm BLE after a give-up: clear the give-up state + BLE cooldown so
+        ``active_transport`` reconsiders BLE on the next poll.
+
+        Backs the 'Retry BLE' button and the night auto-recovery (after a remote
+        Luba restart) — lifts the give-up demotion without waiting out
+        ``_BLE_GIVEUP_COOLDOWN`` or restarting Core.
+        """
+        self._ble_given_up = False
+        self._ble_reset_fired.clear()
+        ble = self._transports.get(TransportType.BLE)
+        if ble is not None:
+            cast(BLETransport, ble).clear_cooldown()
+        _logger.info(
+            "DeviceHandle[%s]: BLE give-up cleared (manual retry) — BLE re-armed for next poll",
+            self.device_name,
+        )
+
     async def send_raw(self, payload: bytes, *, prefer_ble: bool | None = None) -> None:
         """Send raw bytes via the best available transport, with BLE fallback on offline."""
         _logger.debug(

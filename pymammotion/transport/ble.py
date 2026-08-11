@@ -196,6 +196,15 @@ class BLETransport(Transport):
         """
         self._connect_cooldown_until = time.monotonic() + seconds
 
+    def clear_cooldown(self) -> None:
+        """Clear any active connect-cooldown so ``is_usable`` can become True at once.
+
+        Backs the 'retry BLE now' path (manual button / night auto-recovery after a
+        remote Luba restart): lifts the give-up demotion (``arm_cooldown``) without
+        waiting out the full window or restarting Core.
+        """
+        self._connect_cooldown_until = 0.0
+
     @property
     def ble_address(self) -> str | None:
         """Address of the cached BLEDevice, or None if no device is set."""
